@@ -51,8 +51,9 @@ def load_data(filepath: str, return_threshold: float = 0.01) -> pd.DataFrame:
     # 4. Set index early for time filtering
     df = df.set_index("timestamp")
 
-    # 5. Filter to regular trading hours (09:30-15:59:59.999999999)
-    df = df.between_time("09:30", "15:59:59.999999999")
+    # 5. Filter to regular trading hours (09:30 inclusive, 16:00 exclusive)
+    #df = df.between_time("09:30", "15:59:59.9999", inclusive="left")
+    df = df.between_time("09:30", "12:35", inclusive="left")  # For testing, use shorter window
 
     # 6. Remove quote-stuffing noise (consecutive identical quotes)
     # These add no information and distort volatility
