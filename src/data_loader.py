@@ -2,10 +2,31 @@ import pandas as pd
 import numpy as np
 
 
-def load_data(filepath: str) -> pd.DataFrame:
+def load_data(filepath: str, return_threshold: float = 0.01) -> pd.DataFrame:
     """
     Load TAQ quote data and return cleaned dataframe
-    with timestamp index, mid price, and log returns.
+    with timestamp index, mid price, and quote-based log returns.
+    
+    This function:
+    - Filters to regular trading hours (09:30-15:59:59.999999999)
+    - Removes locked/crossed markets (ask <= bid)
+    - Removes extreme spreads (>1% of mid)
+    - Removes quote-stuffing noise (consecutive identical quotes)
+    - Filters outlier returns (microstructure glitches)
+    - Returns QUOTE-BASED volatility (not trade-based)
+    
+    Parameters
+    ----------
+    filepath : str
+        Path to TAQ CSV file
+    return_threshold : float
+        Maximum allowed log return (default 0.01 = 1% = bad data)
+    
+    Returns
+    -------
+    pd.DataFrame
+        Cleaned quote data with columns:
+        [bid, ask, bidsiz, asksiz, mid, log_return]
     """
 
     # 1. Load CSV
@@ -33,62 +54,105 @@ def load_data(filepath: str) -> pd.DataFrame:
     # 5. Filter to regular trading hours (09:30-15:59:59.999999999)
     df = df.between_time("09:30", "15:59:59.999999999")
 
-    # 6. Drop bad quotes
-    df = df[(df["bid"] > 0) & (df["ask"] > 0)]
-    df = df[df["ask"] >= df["bid"]]
+    # 6. Remove quote-stuffing noise (consecutive identical quotes)
+    # These add no information and distort volatility
+    df["bid_changed"] = df["bid"].shift() != df["bid"]
+    df["ask_changed"] = df["ask"].shift() != df["ask"]
+    df = df[df["bid_changed"] | df["ask_changed"]]
+    df = df.drop(columns=["bid_changed", "ask_changed"])
 
-    # 7. Remove extreme spreads (> 1% of mid) - microstructure noise
+    # 7. Drop bad quotes (invalid bid/ask, crossed/locked)
+    df = df[(df["bid"] > 0) & (df["ask"] > 0)]
+    df = df[df["ask"] > df["bid"]]  # Exclude locked (ask==bid) and crossed (ask<bid)
+
+    # 8. Remove extreme spreads (> 1% of mid) - microstructure noise
     spread = df["ask"] - df["bid"]
     mid_price = (df["bid"] + df["ask"]) / 2
     df = df[spread / mid_price < 0.01]
 
-    # 8. Compute mid
+    # 9. Compute mid price
     df["mid"] = (df["bid"] + df["ask"]) / 2
 
-    # 9. Sort and compute log returns
+    # 10. Sort and compute quote-based log returns
     df = df.sort_index()
     df["log_return"] = np.log(df["mid"]).diff()
 
+    # 11. Remove outlier returns (bad data/glitches)
+    # 1% tick-to-tick move in SPY at millisecond freq = almost always bad data
+    df = df[df["log_return"].abs() < return_threshold]
+
     return df[["bid", "ask", "bidsiz", "asksiz", "mid", "log_return"]]
 
-def resample_to_1min(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+def compute_realized_vol(df: pd.DataFrame, minute: int = 1) -> pd.DataFrame:
+    """
+    Compute realized volatility from tick-level log returns.
+    
+    This computes true microstructure-aware volatility:
+    RV = sqrt(sum of squared log returns within period)
+    
+    More accurate than close-to-close returns for high-frequency data.
+    Essential for market-making models.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Tick-level data with 'log_return' column and timestamp index
+    minute : int
+        Resampling interval in minutes (default 1)
+    
+    Returns
+    -------
+    pd.DataFrame
+        Data with columns:
+        [bid, ask, mid, realized_vol]
+        aggregated to minute frequency
+    """
+    
+    # Compute realized variance: sum of squared returns
+    rv_squared = (df["log_return"] ** 2).resample(f"{minute}min").sum()
+    
+    # Take square root to get realized volatility
+    realized_vol = np.sqrt(rv_squared)
+    
+    # Get last quote of each minute for mid price
+    df_1min = df[["bid", "ask", "mid", "bidsiz", "asksiz"]].resample(f"{minute}min").last()
+    
+    # Combine
+    df_1min["realized_vol"] = realized_vol
+    
+    # Drop empty bars
+    df_1min = df_1min.dropna(subset=["mid"])
+    
+    return df_1min[[
+        "bid", "ask", "bidsiz", "asksiz", "mid", "realized_vol"
+    ]]
+
+
+def resample_to_1min(df: pd.DataFrame) -> pd.DataFrame:
     """
     Resample tick data to 1-minute frequency using last quote.
+    
+    This is a simpler approach that uses close-to-close (quote-based)
+    returns. For high-frequency analysis, use compute_realized_vol()
+    instead, which properly captures intraday volatility.
     
     Parameters
     ----------
     df : pd.DataFrame
         Tick-level data with timestamp index
-    verbose : bool
-        Print progress updates (default True)
     
     Returns
     -------
     pd.DataFrame
-        1-minute resampled data
+        1-minute aggregated data
     """
-    
-    def log(msg):
-        if verbose:
-            elapsed = (datetime.now() - start_time).total_seconds()
-            mins, secs = int(elapsed // 60), int(elapsed % 60)
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            print(f"[{timestamp} | {mins}m {secs}s] {msg}", flush=True)
-    
-    start_time = datetime.now()
-    log(f"Resampling {len(df):,} tick rows to 1-minute frequency...")
-    
+
     df_1min = df.resample("1min").last()
-    log(f"✅ Resampled to {len(df_1min):,} 1-minute bars")
 
     # Drop empty minutes
-    log("Dropping empty minutes...")
     df_1min = df_1min.dropna(subset=["mid"])
-    log(f"✅ After removing empty minutes: {len(df_1min):,} bars")
 
-    # Recompute log returns after resampling
-    log("Recomputing log returns...")
+    # Recompute log returns after resampling (close-to-close 1-min returns)
     df_1min["log_return"] = np.log(df_1min["mid"]).diff()
-    log(f"✅ resample_to_1min() complete")
 
     return df_1min
