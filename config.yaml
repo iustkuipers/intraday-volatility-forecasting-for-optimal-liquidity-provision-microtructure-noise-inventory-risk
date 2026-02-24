@@ -1,0 +1,14 @@
+asset: SPY
+bar_frequency: 1min
+ewma_lambda: 0.94
+
+spread:
+  base_spread: 0.01
+  vol_multiplier: 2.0
+
+inventory:
+  penalty_phi: 0.001
+
+simulation:
+  fee_per_trade: 0.0001
+  initial_capital: 100000
