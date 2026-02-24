@@ -171,13 +171,7 @@ Key parameters in `main.py`:
 - 🔄 Adverse selection filter
 - 🔄 Multi-day analysis
 
-## References
 
-- Andersen & Bollerslev (1998) — Realized volatility
-- Corsi (2009) — HAR-RV model
-- Avellaneda & Stoikov (2008) — Market-making under inventory risk
-- RiskMetrics (1996) — EWMA variance estimation
-- Hasbrouck (2007) — *Empirical Market Microstructure*
 
 ## License
 
