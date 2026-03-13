@@ -1,178 +1,315 @@
 # Intraday Volatility Forecasting for Optimal Liquidity Provision
+### Under Microstructure Noise and Inventory Risk
 
-Research project on volatility forecasting and market-making strategy optimization under microstructure noise and inventory risk, using TAQ tick data from WRDS.
+An event-driven market-making simulator for SPY built on TAQ (Trade and Quote) data. The system replays a full day of consolidated quotes and trade prints tick-by-tick, applies a pluggable quoting strategy with inventory skew and realized-volatility adaptation, and produces a detailed performance record including PnL, fill rate, adverse selection, and drawdown metrics.
 
-## Project Overview
+---
 
-The pipeline implements:
-- **Data Loading & Cleaning**: TAQ quote ingestion with professional microstructure noise filtering
-- **Realized Volatility**: Tick-level RV estimation (Andersen & Bollerslev)
-- **EWMA Forecasting**: One-step-ahead variance forecasts (λ=0.94, RiskMetrics)
-- **Market-Making Engine**: Simulation of bid/ask quoting with fill, inventory, and P&L tracking
-- **Strategy Comparison**: Constant-spread baseline vs. volatility-adaptive quoting
+## Table of Contents
 
-## Directory Structure
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Data Pipeline](#data-pipeline)
+- [Simulator Components](#simulator-components)
+- [Strategies](#strategies)
+- [Metrics](#metrics)
+- [Setup](#setup)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Test Suite](#test-suite)
+- [Results](#results)
+
+---
+
+## Overview
+
+The project implements an **intraday market-making simulation** for a single equity (SPY) with the following research objectives:
+
+1. **Optimal spread quoting** under microstructure noise — separating genuine price discovery from transient quote flickering.
+2. **Inventory risk management** — skewing quotes away from the current position to mean-revert inventory without sacrificing fill rate.
+3. **Volatility-adaptive quoting** — widening spreads when realized volatility rises to protect against adverse selection.
+
+The baseline strategy (`ConstantSpreadStrategy`) implements the Avellaneda–Stoikov-inspired reservation-price framework:
+
+$$r = m - \gamma \cdot \sigma \cdot m \cdot q$$
+
+$$s^{bid} = r - \delta, \quad s^{ask} = r + \delta$$
+
+where $m$ is the mid price, $\gamma$ is risk aversion, $\sigma$ is realized volatility, $q$ is inventory, and $\delta$ is the half-spread.
+
+---
+
+## Architecture
 
 ```
-├── config.yaml                     # Configuration parameters
-├── main.py                         # Pipeline entry point
-├── requirements.txt                # Python dependencies
-│
-├── data/                           # Raw TAQ data (excluded from git)
-│   └── t822bpd5q8g1deky.csv       # SPY quotes, 2024-01-03 (~24M raw rows)
-│
-├── src/
-│   ├── data_loader.py             # TAQ loading, cleaning, RV computation
-│   ├── volatility/
-│   │   ├── ewma.py                # EWMA variance/vol forecasting
-│   │   ├── har.py                 # HAR model (placeholder)
-│   │   └── realized_vol.py        # Realized variance & rolling RV
-│   ├── market_making/
-│   │   ├── quoting.py             # Vol-adaptive spread computation
-│   │   ├── inventory.py           # Inventory management (placeholder)
-│   │   └── pnl.py                 # P&L utilities (placeholder)
-│   ├── simulator/
-│   │   ├── engine.py              # MarketMakerEngine — tick simulation
-│   │   └── fill_model.py          # Fill model (placeholder)
-│   └── evaluation/
-│       ├── metrics.py             # Performance metrics (placeholder)
-│       └── plots.py               # Visualization utilities (placeholder)
-│
-├── test/
-│   ├── test_ewma.py               # EWMA unit tests
-│   ├── test_realized_vol.py       # Realized vol unit tests
-│   ├── test_engine.py             # Engine unit tests
-│   ├── test_quoting.py            # Quoting unit tests
-│   └── pipelines/
-│       └── test_volatility_pipeline.py  # Integration test
-│
-├── notebooks/
-│   └── exploratory.ipynb          # EDA
-│
-└── results/                        # Output plots and metrics
+Events (quotes + trades)
+        │
+        ▼
+  MarketState          ← one snapshot per event row
+        │
+        ▼
+  Strategy             ← computes two-sided Quote (bid/ask prices + sizes)
+        │
+        ▼
+  ExecutionEngine      ← holds resting orders, enforces hard position cap
+        │
+        ▼
+  FillModel            ← determines if a resting order was hit by a trade
+        │
+        ▼
+  Accounting           ← updates inventory, cash, realized PnL (FIFO avg-cost)
+        │
+        ▼
+  Snapshot row         → results DataFrame
 ```
+
+The `Simulator` is a pure orchestrator — it wires the components together and iterates over the event stream. All domain logic lives in the individual components, making each one independently testable and swappable.
+
+---
+
+## Project Structure
+
+```
+.
+├── main.py                         # Entry point — configure, run, report
+│
+├── data/
+│   ├── raw/                        # Original TAQ CSV exports
+│   ├── clean/                      # Cleaned quotes.parquet & trades.parquet
+│   └── merged/                     # Unified events.parquet (quotes + trades)
+│
+├── data_preparation/
+│   ├── data_load_bid_ask.py        # Clean consolidated quotes → parquet
+│   ├── data_load_trades.py         # Clean TAQ trades → parquet
+│   ├── data_merged.py              # Merge quotes+trades into event stream
+│   └── data_analysis.py           # Exploratory statistics
+│
+├── simulator/
+│   ├── simulator.py                # Orchestrator (event loop)
+│   ├── market_state.py             # Parses event row → attribute snapshot
+│   ├── strategy_base.py            # BaseStrategy interface
+│   ├── strategy.py                 # ConstantSpreadStrategy, VolatilityAdaptiveStrategy
+│   ├── execution_engine.py         # Manages resting orders + position cap
+│   ├── fill_model.py               # Fill logic (DeterministicFillModel)
+│   ├── accounting.py               # Inventory, cash, PnL ledger (FIFO)
+│   ├── order.py                    # Quote / Fill data types
+│   ├── metrics.py                  # Post-run performance statistics
+│   └── output.py                   # Saves results + metrics to timestamped folder
+│
+├── volatility/                     # (in development) volatility forecasting models
+│
+├── tests/
+│   ├── test_accounting.py
+│   ├── test_execution_engine.py
+│   ├── test_fill_model.py
+│   ├── test_market_state.py
+│   ├── test_metrics.py
+│   ├── test_order.py
+│   ├── test_simulator.py
+│   └── test_strategy.py
+│
+└── results/                        # Auto-saved simulation outputs (git-ignored)
+    └── <timestamp>_<label>/
+        ├── results.csv
+        └── metrics.json
+```
+
+---
+
+## Data Pipeline
+
+Run the preparation scripts **once** in order before the first simulation:
+
+```bash
+# 1. Clean raw quote data
+python data_preparation/data_load_bid_ask.py
+
+# 2. Clean raw trade data
+python data_preparation/data_load_trades.py
+
+# 3. Merge into unified event stream
+python data_preparation/data_merged.py
+```
+
+### Quote cleaning (`data_load_bid_ask.py`)
+- Filters to regular trading hours (09:30 – 16:00)
+- Removes crossed or zero-width quotes
+- Deduplicates same-timestamp quotes
+- Drops stale exchange snapshots with spread > 0.2% of mid
+
+### Trade cleaning (`data_load_trades.py`)
+- RTH filter
+- Removes zero-price / zero-size prints
+- Applies Lee–Ready direction inference
+
+### Event stream (`data_merged.py`)
+- Enriches each trade with its prevailing quote state via backward `merge_asof`
+- Computes rolling realized volatility (20-event window)
+- Computes order-flow imbalance
+- Heals residual NBBO spikes (spread > 10× rolling median) by forward-filling
+- Saves `events.parquet` (~22M rows for a full day) and `events_5min.parquet`
+
+---
+
+## Simulator Components
+
+| Component | Responsibility |
+|---|---|
+| `MarketState` | Converts a DataFrame row into `.mid`, `.bid`, `.ask`, `.last_trade_price`, `.realized_vol`, etc. |
+| `BaseStrategy` | Interface: `compute_quote(state, inventory) → Quote` |
+| `ExecutionEngine` | Holds the current resting `Quote`; enforces hard position cap via `max_position_value` |
+| `BaseFillModel` | Interface: `evaluate(engine, state) → list[Fill]` |
+| `DeterministicFillModel` | Fills whenever a trade crosses the resting quote price |
+| `Accounting` | FIFO avg-cost ledger; tracks `inventory`, `cash`, `realized_pnl`, `portfolio_value` |
+| `Metrics` | Computes Sharpe, max drawdown, fill rate, spread capture, adverse selection |
+| `OutputManager` | Saves `results.csv` and `metrics.json` under `results/<timestamp>_<label>/` |
+
+---
+
+## Strategies
+
+### `ConstantSpreadStrategy`
+
+Baseline strategy. Parameters are **dimensionless** and scale automatically with price and volatility:
+
+| Parameter | Description | SPY example |
+|---|---|---|
+| `spread_frac` | Half-spread as fraction of mid | `0.000011` → ~$0.005 at $472 (NBBO touch) |
+| `risk_aversion` | Inventory skew coefficient γ | `0.00005` → ~45% of half-spread at 100 shares |
+| `max_position_value` | Hard inventory cap in dollars | `500_000` → ~1059 shares at $472 |
+| `vol_cap` | Ceiling on realized vol input | `0.005` → prevents bad ticks from blowing out skew |
+| `order_size` | Shares per quote | `100` |
+
+### `VolatilityAdaptiveStrategy`
+
+Extends `ConstantSpreadStrategy` by adding a volatility-proportional spread premium:
+
+$$\delta = \delta_0 + \text{vol\_spread\_coef} \times \sigma$$
+
+| Additional Parameter | Description |
+|---|---|
+| `vol_spread_coef` | Extra spread per unit of realized vol |
+
+---
+
+## Metrics
+
+Computed by `Metrics.compute(results_df)` after each run:
+
+| Metric | Description |
+|---|---|
+| `total_pnl` | Final portfolio value (unrealized + realized) |
+| `realized_pnl` | Profit locked in by closed round-trips |
+| `sharpe` | Mean(ΔPortfolio) / Std(ΔPortfolio) |
+| `max_drawdown` | Largest peak-to-trough decline |
+| `inventory_std` | Standard deviation of inventory |
+| `max_inventory` | Peak absolute inventory |
+| `fill_rate` | Fraction of events where a fill occurred |
+| `n_fills` | Total fills |
+| `spread_capture` | `realized_pnl / n_round_trips` — avg profit per round trip |
+| `n_round_trips` | Number of times inventory returned to zero |
+
+The main script also reports **adverse selection** (1-second mid-price move after each fill) and **quote sanity** (fraction of events where `bid_quote > mid` or `ask_quote < mid`, which must always be 0%).
+
+---
 
 ## Setup
 
+**Requirements:** Python 3.11+
+
 ```bash
-pip install -r requirements.txt
+pip install pandas numpy pyarrow
 ```
 
-Data file is excluded from the repository (`.gitignore`). Obtain TAQ quote data from WRDS and place it at `data/t822bpd5q8g1deky.csv`.
+No external market-data subscriptions are needed — the raw TAQ CSV files are already included under `data/raw/`.
 
-## Running the Pipeline
+---
+
+## Usage
 
 ```bash
+# Full pipeline (first time only)
+python data_preparation/data_load_bid_ask.py
+python data_preparation/data_load_trades.py
+python data_preparation/data_merged.py
+
+# Run simulation
 python main.py
 ```
 
-This executes the full pipeline:
-
-1. **Load & clean** TAQ tick data (~24M rows → ~6M after RTH filter + microstructure filters)
-2. **Compute realized volatility** per 1-minute bar
-3. **Fit EWMA** variance forecast (λ=0.94)
-4. **Simulate baseline strategy** — constant half-spread δ=0.03
-5. **Simulate vol-adaptive strategy** — δ = K0 + K1 × σ̂ (K0=0.01, K1=1.0)
-6. **Print comparison**
-
-### Sample Output (SPY, 2024-01-03)
+Output is printed to the terminal and saved automatically:
 
 ```
-[21:51:27] ✅ Loaded 5,987,412 tick rows | 09:30 → 12:34 (RTH)
-[21:51:29] ✅ 185 1-min bars
-[21:51:31] ✅ Mean RVol: 0.0153 | EWMA vol mean: 0.0183, max: 0.0476
+Loading events ...
+Window : 2026-03-13 09:30:00  →  2026-03-13 09:35:00  (12,345 rows)
 
-======================================================================
-METRIC                     BASELINE    VOL-ADAPTIVE
-======================================================================
-total_pnl                   -7.075       -4.285  (+39.4%)
-mean_pnl_per_bar            -0.0385      -0.0233 (+39.4%)
-std_pnl_per_bar              0.7391       0.4816 (-34.8%)
-sharpe_ratio                -0.052       -0.048  (+6.9%)
-inventory_variance           7.69         5.97   (-22.4%)
-max_abs_inventory            12           10
-n_trades                     144          147
-======================================================================
+=======================================================
+  Events          : 12,345
+  Total fills     : 87  (bid 44 / ask 43)
+  Fill rate       : 0.7049%
+  Final inventory : 100
+  Realized PnL    : 12.3400
+  Portfolio value : 59.2100
+=======================================================
+
+Metrics:
+  total_pnl            59.21
+  realized_pnl         12.34
+  sharpe               1.83
+  ...
+
+Saved → results/20260313_224818_SPY_NBBOtouch/
 ```
 
-**Key finding**: Volatility-adaptive quoting reduces losses by 39%, cuts PnL volatility by 35%, and lowers inventory variance by 22% versus the constant-spread baseline. The EWMA volatility signal is economically meaningful even on a single trading day.
-
-## Running Tests
-
-```bash
-python test/test_ewma.py
-python test/test_realized_vol.py
-python test/test_engine.py
-python test/test_quoting.py
-python test/pipelines/test_volatility_pipeline.py
-```
-
-All 20 tests pass. Each file prints ✅/❌ results directly when run.
-
-## Key Components
-
-### Data Cleaning (`src/data_loader.py`)
-
-`load_data(filepath)` applies the following filters in order:
-
-| Filter | Purpose |
-|---|---|
-| RTH window `[09:30, 16:00)` | Exclude pre/post-market and closing auction |
-| `ask > bid` | Remove crossed/locked markets |
-| Spread ≤ 1% of mid | Remove outlier quotes and stale streams |
-| Quote-stuffing removal | Drop consecutive identical bid/ask pairs |
-| \|log return\| ≤ 1% | Remove outlier price jumps |
-
-Outputs a `DatetimeIndex` DataFrame with: `bid, ask, bidsiz, asksiz, mid, log_return`.
-
-### EWMA Forecasting (`src/volatility/ewma.py`)
-
-$$\hat{\sigma}^2_{t+1} = \lambda \hat{\sigma}^2_t + (1 - \lambda) \, \text{RV}_t$$
-
-`ewma_variance_forecast(realized_var, lam=0.94)` — produces one-step-ahead variance forecasts from 1-minute realized variance bars.
-
-### Market-Making Engine (`src/simulator/engine.py`)
-
-`MarketMakerEngine.run(df, delta)`:
-- `delta` can be a scalar (constant spread) or `pd.Series` (time-varying)
-- Fill logic: next mid ≤ bid → buyer hits, next mid ≥ ask → seller lifts
-- Tracks: `inventory`, `cash`, `portfolio_value`, `trade_count` per bar
-
-### Vol-Adaptive Quoting (`src/market_making/quoting.py`)
-
-```python
-delta = compute_spread(sigma_hat, k0=0.01, k1=1.0)  # δ = k0 + k1·σ̂
-```
-
-Wider spreads in high-volatility regimes reduce adverse selection and inventory exposure.
+---
 
 ## Configuration
 
-Key parameters in `main.py`:
+Edit the `CONFIG` dict at the top of `main.py`:
 
-| Parameter | Default | Description |
-|---|---|---|
-| `DELTA` | 0.03 | Constant half-spread for baseline |
-| `EWMA_LAM` | 0.94 | EWMA decay factor (RiskMetrics) |
-| `K0` | 0.01 | Vol-adaptive spread intercept |
-| `K1` | 1.0 | Vol-adaptive spread sensitivity |
+```python
+CONFIG = dict(
+    spread_frac        = 0.000011,   # NBBO-touch: ~1 bp at SPY
+    order_size         = 100,        # shares per quote
+    risk_aversion      = 0.00005,    # inventory skew strength
+    max_position_value = 500_000,    # hard cap: ~1059 shares at $472
+    vol_cap            = 0.005,      # clamp realized vol input
+)
+```
 
-## Progress
+To run over the full trading day instead of the first 5 minutes, replace the windowing slice:
 
-- ✅ TAQ data loading with professional microstructure cleaning
-- ✅ Realized volatility estimation from tick returns
-- ✅ EWMA variance forecasting
-- ✅ Market-making simulation engine (scalar + series delta)
-- ✅ Vol-adaptive quoting strategy
-- ✅ Baseline vs. vol-adaptive comparison
-- ✅ Full unit test suite (20 tests)
-- 🔄 Inventory skew (quote adjustment proportional to position)
-- 🔄 HAR model
-- 🔄 Adverse selection filter
-- 🔄 Multi-day analysis
+```python
+# current (5-minute window)
+t_end   = t_start + pd.Timedelta(minutes=5)
+events  = events_full[events_full["timestamp"] < t_end].copy()
 
+# full day
+events  = events_full.copy()
+```
 
+---
 
-## License
+## Test Suite
 
-Private research project.
+```bash
+python -m pytest tests/ -v
+```
+
+Each simulator component has a dedicated unit-test module covering edge cases (zero inventory, position cap breach, crossed quotes, etc.).
+
+---
+
+## Results
+
+Saved runs are stored under `results/` as:
+
+```
+results/
+└── <YYYYMMDD_HHMMSS>_<label>/
+    ├── results.csv     ← full snapshot time series
+    └── metrics.json    ← summary statistics
+```
+
+The `results/troubleshooting/` sub-folder contains earlier calibration runs used during parameter tuning.
